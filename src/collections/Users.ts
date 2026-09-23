@@ -55,11 +55,12 @@ export const Users: CollectionConfig = {
           type: 'text',
           admin: { description: 'Full profile URL, e.g. https://linkedin.com/in/...' },
         },
-        {
-          name: 'avatar',
-          type: 'upload',
-          relationTo: 'media',
-        },
+        // No `avatar` upload field here: an upload/relationship field can't
+        // be filled in on the "create first user" screen — there's no
+        // session yet, so its inline create-a-Media-doc request 401s
+        // (Unauthorized). Re-add once there's an actual need for it; at
+        // that point set it after the account exists (editing the user, not
+        // during signup) to avoid the same issue.
       ],
     },
   ],
