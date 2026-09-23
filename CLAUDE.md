@@ -102,13 +102,21 @@ model.
   multiple sequential redirect hops, not a single direct one — no
   chain-resolution logic, deliberately.
 - **`Users.ts`** — besides CMS login, has a "Blog Author Profile"
-  collapsible (`jobTitle`, `bio`, `linkedinUrl`, `avatar`) filled in once per
-  person, not per post. `Posts.ts` denormalizes these into virtual
-  `authorJobTitle`/`authorBio`/`authorLinkedinUrl`/`authorAvatarUrl` fields,
-  which `mj-digital-services` reads to render a "Written by" card under
-  every post. It's per-*author*, not per-*post*: fill in a person's profile
-  once and every post (old or new) they're credited on picks it up
-  immediately, since it's computed live at read time, not stored on the post.
+  collapsible (`jobTitle`, `bio`, `linkedinUrl`) filled in once per person,
+  not per post. `Posts.ts` denormalizes these into virtual
+  `authorJobTitle`/`authorBio`/`authorLinkedinUrl` fields, which
+  `mj-digital-services` reads to render a "Written by" card under every
+  post. It's per-*author*, not per-*post*: fill in a person's profile once
+  and every post (old or new) they're credited on picks it up immediately,
+  since it's computed live at read time, not stored on the post.
+  **Deliberately no `avatar` upload field**: an upload/relationship field
+  can't be filled in on Payload's "create first user" screen — there's no
+  session yet, so its inline create-a-Media-doc request 401s
+  (`Unauthorized`). Hit this during initial local setup and removed the
+  field rather than working around a first-run-only edge case; `Posts.ts`'s
+  `authorAvatarUrl` virtual field hook still safely resolves to `undefined`
+  with it gone. Re-add only once there's an actual need, and set it by
+  editing an already-created user, never during signup.
 
 ## Scheduled Publishing
 
@@ -207,29 +215,60 @@ Without this, published changes still show up on `mj-digital-services`,
 just up to 60s later (its fetch-level `revalidate: 60`) instead of
 immediately.
 
-## Status (as of 2026-09-22)
+## Status (as of 2026-09-23) — deployed and live
 
-Repo scaffolded, mirroring `cashlo-cms` 1:1 with names/branding swapped.
-**Not yet deployed** — needs:
-- A MongoDB database created (separate DB name on the same cluster as
-  `mj-digital-backend`, or its own cluster).
-- `mj-digital-backend`'s existing R2 credentials confirmed reusable (same
-  account, `mj-digital-media` bucket, `cms-media/` prefix here).
-- Vercel project created, `cms.mjdigitalservices.com` DNS CNAME added.
-- `mj-digital-backend` needs a matching `triggerCmsScheduledPublish.job.js`
-  cron wired into `server.js` (see that repo's CLAUDE.md) — added in this
-  same work session; confirm `CRON_SECRET`/`CMS_CRON_SECRET` match on both
-  sides before relying on scheduled publishing.
-- `mj-digital-services`'s `src/lib/blogApi.ts` needs to be repointed at
-  this CMS's REST API and `/api/revalidate` route added — also added in
-  this same work session; confirm `NEXT_PUBLIC_CMS_URL` and
-  `REVALIDATE_SECRET` are set on its side before relying on either.
-- First CMS user (admin role) needs creating via Payload's own first-run
-  admin signup screen.
-- No content has been migrated from `mj-digital-backend`'s legacy `Blog`
-  collection yet — same caveat as `cashlo-cms` had: don't assume old-system
-  content is safe to delete until it's confirmed migrated or intentionally
-  dropped.
+Deployed on Vercel (`cms.mjdigitalservices.com`, DNS via GoDaddy CNAME +
+`_vercel` TXT verification since the apex domain was on a different Vercel
+account at setup time), connected to a production MongoDB database, R2
+uploads confirmed working, `mj-digital-backend`'s cron pings scheduled
+publishing. First admin user created via Payload's own first-run signup
+screen. No content has been migrated from `mj-digital-backend`'s legacy
+`Blog` collection yet — don't assume old-system content is safe to delete
+until it's confirmed migrated or intentionally dropped.
+
+### Deployment issues hit and fixed (useful if they resurface)
+
+- **"missing secret key" on every request** — `PAYLOAD_SECRET` wasn't set
+  in Vercel's env vars yet. Payload throws this at `BasePayload.init()`,
+  not at build time, so it only surfaces on the first real request after
+  deploy.
+- **"Invalid scheme, expected connection string to start with mongodb://
+  or mongodb+srv://"** — `DATABASE_URI` was unset in Vercel, so
+  `mongooseAdapter({ url: process.env.DATABASE_URI || '' })` fell back to
+  an empty string. Fix is just setting the env var and **redeploying** —
+  Vercel does not hot-apply new env vars to an already-running deployment.
+- **`POST /api/media` 500, `getaddrinfo ENOTFOUND
+  <bucket>..r2.cloudflarestorage.com`** (note the double dot) —
+  `R2_ACCOUNT_ID` was empty in Vercel. The endpoint template
+  (`payload.config.ts`) is `` `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com` ``;
+  an empty account id collapses that to `https://.r2.cloudflarestorage.com`,
+  and R2's virtual-hosted-style addressing then prepends the bucket name —
+  bucket + `.` + `.r2.cloudflarestorage.com` = the double-dot hostname.
+  Fix: set `R2_ACCOUNT_ID` correctly and redeploy. If this resurfaces,
+  check ALL FOUR R2 vars, not just this one — they're easy to skip when
+  copying a table of env vars by hand.
+- **Admin panel consistently slow (~1.5-1.8s per request, not just first
+  load)** — Atlas cluster is in Mumbai (`ap-south-1`); Vercel projects
+  default their Function Region to `iad1` (US East) unless changed. Fixed
+  by setting this project's Vercel **Function Region to `bom1` (Mumbai)**
+  to match. Diagnosed by timing the same request twice back-to-back with
+  curl — a real cold-start would only hit the first request, so two
+  consecutive ~1.7s calls pointed at a persistent cause (region mismatch),
+  not Vercel spin-down. **Any new Vercel project touching this same Atlas
+  cluster should be set to `bom1` from the start.**
+- **Database isolation must be double-checked, not assumed** — while
+  debugging the slowness above, MongoDB Atlas's database list only showed
+  one `mj-digital` database, not a distinct `mj-digital-cms` one. This
+  raised a real concern (Payload's `users` collection would collide with
+  `mj-digital-backend`'s Mongoose `User` collection, both named `users` by
+  default) that turned out to be a false alarm once actually checked, but
+  it's a cheap thing to verify any time this cluster/these two apps come up
+  again: confirm `DATABASE_URI` here names a database distinct from
+  `mj-digital-backend`'s `MONGODB_URI`.
+- **Cluster0 is a free M0 tier** — shared/throttled resources, 500
+  connection cap, and (M0-specific) can auto-pause after long inactivity.
+  Not a current bottleneck (usage was well under limits when checked), but
+  worth upgrading before it becomes one for a production CMS.
 
 ## Not built yet
 
